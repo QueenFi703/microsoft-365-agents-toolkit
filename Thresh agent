@@ -1,0 +1,118 @@
+import { createNodeMiddleware, createProbot, type ApplicationFunction } from "probot";
+import http from "node:http";
+import { run } from "../agent/index.js";
+import type { RunContext } from "../shared/types.js";
+
+/**
+ * ─────────────────────────────────────────────────────────────
+ * Thresh Agent Server (upgraded routing layer)
+ * - introduces skill selection hook
+ * - centralizes context creation
+ * - prepares for registry-driven execution + auto-publish
+ * ─────────────────────────────────────────────────────────────
+ */
+
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
+const probot = createProbot();
+
+/**
+ * 🔮 Skill Registry (lightweight v1)
+ * Later this can become dynamic (DB / GitHub / remote registry)
+ */
+function selectSkills(eventType: string, payload: any) {
+  const base: string[] = ["lint", "heal"];
+
+  if (eventType.startsWith("pull_request")) {
+    return [...base, "pr-analyzer", "diff-reviewer"];
+  }
+
+  if (eventType === "push") {
+    return [...base, "repo-health-scan"];
+  }
+
+  if (eventType === "workflow_run") {
+    return [...base, "ci-failure-triage"];
+  }
+
+  return base;
+}
+
+/**
+ * Centralized RunContext builder (removes duplication noise)
+ */
+async function buildCtx(context: any, prNumber?: number): Promise<RunContext> {
+  const auth = await context.octokit.auth({ type: "installation" }) as { token: string };
+
+  return {
+    token: auth.token,
+    commitFixes: process.env.COMMIT_FIXES !== "false",
+    prNumber,
+  };
+}
+
+/**
+ * Optional hook for future GitHub auto-publish / registry sync
+ * (safe no-op placeholder for now)
+ */
+async function publishRunTrace(params: {
+  owner: string;
+  repo: string;
+  ref?: string;
+  event: string;
+  skills: string[];
+}) {
+  // Future:
+  // - push agent decision log to GitHub artifact
+  // - or dispatch workflow to registry service
+  console.log("[thresh/trace]", params);
+}
+
+const threshApp: ApplicationFunction = (robot) => {
+  robot.on("push", async (context) => {
+    const { owner, repo } = context.repo();
+    const ref = context.payload.ref.replace(/^refs\/heads\//, "");
+    const defaultBranch = context.payload.repository.default_branch;
+
+    if (ref !== defaultBranch) return;
+
+    const skills = selectSkills("push", context.payload);
+    const ctx = await buildCtx(context);
+
+    await publishRunTrace({ owner, repo, ref, event: "push", skills });
+
+    await run({ ctx, owner, repo, ref, skills });
+  });
+
+  robot.on(["pull_request.opened", "pull_request.synchronize"], async (context) => {
+    const { owner, repo } = context.repo();
+    const ref = context.payload.pull_request.head.ref;
+    const prNumber = context.payload.pull_request.number;
+
+    const skills = selectSkills("pull_request", context.payload);
+    const ctx = await buildCtx(context, prNumber);
+
+    await publishRunTrace({ owner, repo, ref, event: "pull_request", skills });
+
+    await run({ ctx, owner, repo, ref, prNumber, skills });
+  });
+
+  robot.on("workflow_run.completed", async (context) => {
+    const { owner, repo } = context.repo();
+    const ref = context.payload.workflow_run.head_branch ?? undefined;
+
+    const skills = selectSkills("workflow_run", context.payload);
+    const ctx = await buildCtx(context);
+
+    await publishRunTrace({ owner, repo, ref, event: "workflow_run", skills });
+
+    await run({ ctx, owner, repo, ref, skills });
+  });
+};
+
+// ─── HTTP server ──────────────────────────────────────────────────────────────
+
+const middleware = createNodeMiddleware(threshApp, { probot });
+
+http.createServer(middleware).listen(PORT, () => {
+  console.log(`[thresh/server] online → http://0.0.0.0:${PORT}`);
+});
